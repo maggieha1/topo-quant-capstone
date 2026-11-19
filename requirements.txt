@@ -1,0 +1,6 @@
+yfinance
+ripser
+torch
+torch_geometric
+cvxpy
+matplotlib
