@@ -4,3 +4,4 @@ torch
 torch_geometric
 cvxpy
 matplotlib
+scipy
