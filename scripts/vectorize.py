@@ -10,7 +10,7 @@ from topology import extract_persistence_diagrams
 # Fixed filtration grids, one per homology dimension.
 # They must be the SAME for every window so the vectors are comparable.
 H0_RANGE: Tuple[float, float] = (0.0, 10.0)  # H0 tents span [0, death]; deaths are ~2-5
-H1_RANGE: Tuple[float, float] = (1.5, 6.5)   # H1 loops are short-lived and sit in a narrow band
+H1_RANGE: Tuple[float, float] = (0.5, 6.0)   # H1 loops are short-lived and sit in a narrow band
 
 
 def persistence_landscape(
