@@ -10,8 +10,8 @@ both to forecast short-term volatility regimes.
 
 ## Status
 - ✅ **Phase 1: Topological feature pipeline** (complete)
-- 🔄 **Phase 2: Graph dataset & GNN** (dataset complete; train/test split and model next)
-- ⏳ Phase 3: Model evaluation, portfolio optimization & backtest (cvxpy)
+- ✅ **Phase 2: Graph dataset & data loaders** (complete)
+- 🔄 **Phase 3: T-GNN model, evaluation, portfolio optimization & backtest** (starting)
 
 ## Pipeline Overview
 
@@ -22,7 +22,7 @@ prices → log returns → 30-day windows ─┬─→ Z-scored point clouds →
                                        ├─→ node features → x (10, 4)
                                        └─→ forward 5-day volatility → label y
                                                      ↓
-                                   one PyG graph per trading day (1,220 total)
+                    one PyG graph per trading day (1,220) → chronological train / val / test loaders
 ```
 
 ## Scripts
@@ -37,12 +37,13 @@ prices → log returns → 30-day windows ─┬─→ Z-scored point clouds →
 | `scripts/vectorize.py` | Converts variable-length persistence diagrams into fixed-size persistence landscapes (3 layers × 50 points per dimension) |
 | `scripts/build_topo_dataset.py` | Runs the pipeline over every window and saves features, dates, tickers and config to `data/topo_features.pt` |
 
-### Phase 2: Graphs
+### Phase 2: Graphs & Data Loading
 | Script | What it does |
 |---|---|
 | `scripts/graph_edges.py` | Computes each window's 10 × 10 Pearson correlation matrix and keeps edges with \|ρ\| ≥ 0.3 in PyG COO format |
 | `scripts/build_graph.py` | Builds a PyG `Data` object per window: node features `x`, correlation edges, and the window's persistence landscape as a graph-level `topo` attribute |
 | `scripts/dataset.py` | `MarketGraphDataset`: pairs each graph with a forward-looking volatility label `y`, with built-in look-ahead checks |
+| `scripts/dataloaders.py` | Chronological train / validation / test split with a 35-window embargo, a train-only volatility threshold, and PyG `DataLoader`s |
 
 **Universe:** AAPL, MSFT (tech) · JPM, GS (financials) · XOM, CVX (energy) ·
 UNH, JNJ (healthcare) · PG, WMT (consumer staples)
@@ -59,28 +60,44 @@ Each trading day becomes one graph:
 | Topology `topo` | (1, 300) | H0 + H1 persistence landscapes for the whole market |
 | Label `y` | (1,) | 1 = high-volatility week ahead, 0 = calm |
 
+A batch of 32 graphs becomes `x` (320, 4), `topo` (32, 300) and `y` (32,), with PyG tracking which
+nodes belong to which graph.
+
 ## Prediction Target
 For a window closing on day *t*, the label looks **only** at days *t+1 … t+5*:
 - Compute the standard deviation of the equal-weighted basket's daily returns over those 5 days.
-- Label **y = 1** if it is at or above the **85th percentile of the training period** (threshold = 0.01084), otherwise **y = 0**.
+- Label **y = 1** if it is at or above the **85th percentile of the training split** (threshold = **0.01077**),
+  otherwise **y = 0**.
 - The final 5 windows have no complete future and are dropped, which leaves **1,220 labelled graphs**
   (2021-02-17 to 2025-12-23).
 
-| Period | Stress rate (y = 1) |
-|---|---|
-| First 70% (to 2024-07-10) | 14.99% |
-| Last 30% | 8.74% |
-| Overall | 13.11% |
+## Data Splits
+Chronological, never shuffled across time. **35 windows** (window size + horizon) are dropped between
+blocks, so no trading day appears in both a training label and a validation or test input.
 
-The later period is noticeably calmer than the earlier one, which includes the 2022 bear market.
+| Split | Windows | Dates (window end) | Stress windows |
+|---|---|---|---|
+| Train | 854 | 2021-02-17 to 2024-07-10 | 128 (15.0%) |
+| Validation | 183 | 2024-08-29 to 2025-05-22 | 30 (16.4%) |
+| Test | 113 | 2025-07-16 to 2025-12-23 | **0 (0.0%)** |
+
+Leakage is verified with calendar dates: the last training label day (2024-07-17) comes before the first
+validation input day (2024-07-19), and the last validation label day (2025-05-30) before the first test
+input day (2025-06-03). Training batches are shuffled with a fixed seed for reproducibility.
+
+**Finding: the chronological test block contains no stress windows.** Under the training threshold,
+July–December 2025 was entirely calm; the April 2025 tariff shock falls in validation. A single
+train/test split can therefore only measure false alarms in a calm market, not stress detection, so
+final evaluation will use **walk-forward folds** (below).
 
 ## Key Design Decisions
 
 **Avoiding look-ahead bias**
 - Every window is labelled by its **closing date**, so features dated *t* use only data available at the close of *t*.
 - Labels use only days strictly **after** *t*. This is checked independently using calendar dates, not just row arithmetic.
-- The volatility threshold comes from the training period only, stopping 5 windows before the cutoff so no
-  training label peeks past it.
+- The volatility threshold is computed **explicitly from the training indices** and passed into the dataset,
+  so it stays leak-free even if the split ratios change.
+- A 35-window embargo separates the splits, which is stricter than the 5-window minimum needed to stop labels overlapping.
 
 **Topology**
 - **Within-window Z-scoring** stops high-volatility stocks from dominating the geometry.
@@ -122,19 +139,25 @@ for 5% significance, so 0.3 deliberately keeps some weaker edges and relies on g
   with no edges, while JPM, GS, XOM and CVX, each paired with a highly correlated peer, never were.
 - **Labels capture real stress.** The five most turbulent upcoming weeks all followed the **April 2025 tariff
   announcements**, led by the window ending 2025-04-02, whose next five days held both the crash and the rebound.
+- **Stress is unevenly spread over time.** Training holds 15.0% stress windows (including the 2022 bear market),
+  validation 16.4% (including April 2025), and the most recent half-year none.
 - H1 loop counts range from 0 to 16 per window (mean 6.7).
 
-## Planned Evaluation
-- **Chronological split** with a 5-window gap between training and testing, since overlapping windows would leak
-  information under a random split.
-- **Metrics:** precision, recall and PR-AUC rather than accuracy. With a test-period stress rate of 8.74%,
-  always predicting "calm" would already be about 91% accurate.
+## Evaluation Plan
+- **Walk-forward folds:** train on everything before each test year (with the 35-window embargo), then test on
+  that year, so every stress episode (2022 rate hikes, March 2023 banking stress, August 2024 sell-off,
+  April 2025 tariff shock) is tested exactly once. Scores are reported per fold and averaged.
+- **Metrics:** precision, recall and PR-AUC rather than accuracy. With rare stress, always predicting "calm"
+  scores high accuracy while detecting nothing.
 - **Baselines:** the GNN must beat a simple rule based on current volatility, because volatility tends to persist
   (volatility clustering). Ablations will compare models with and without the topological features.
+- **Scaling:** node and topological features will be standardized using training-split statistics only.
 
 ## Known Limitations
 - 10 stocks is a small universe. Stocks without a sector peer (e.g. UNH) are often isolated in the graph.
 - Overlapping windows mean far fewer *independent* stress episodes than the raw example count suggests.
+- The most recent half-year (Jul–Dec 2025) contains no stress windows, so a single chronological test split
+  cannot measure stress detection.
 - Some stress is driven by news that prices cannot anticipate (e.g. policy announcements made after the close).
 - Hyperparameters (window size, correlation threshold, landscape grids) are not yet tuned on a validation split.
 
@@ -163,4 +186,5 @@ Run from the project root:
 python scripts/data_loader.py          # download prices → data/sp500_log_returns.csv
 python scripts/build_topo_dataset.py   # topological features → data/topo_features.pt
 python scripts/dataset.py              # build and verify the labelled graph dataset
+python scripts/dataloaders.py          # build and verify the chronological splits and loaders
 ```
