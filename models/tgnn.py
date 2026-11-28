@@ -152,7 +152,6 @@ def count_params(module: nn.Module) -> int:
 
 if __name__ == "__main__":
     sys.path.insert(0, SCRIPTS_DIR)
-    from torch_geometric.data import Batch
     from windowing import DATA_PATH
     from build_graph import TOPO_PATH
     from dataloaders import create_chronological_loaders
@@ -163,19 +162,10 @@ if __name__ == "__main__":
         csv_path=DATA_PATH,
         topo_path=TOPO_PATH,
         batch_size=32,
+        seq_len=5,
     )
-    ds = train_loader.dataset.dataset  # the underlying MarketGraphDataset
-
-    # Build a REAL 5-step sequence: for 32 end days, take each day's 4 preceding windows too.
-    # Step s holds windows (i - 4 + s) for every end day i, so the last step is "today".
-    seq_len = 5
-    end_idx = list(range(100, 132))  # 32 consecutive end days, well inside the training block
-    graph_seq = [
-        Batch.from_data_list([ds[i - (seq_len - 1) + s] for i in end_idx])
-        for s in range(seq_len)
-    ]
-    targets = graph_seq[-1].y  # the label belongs to the LAST step (day t)
-    assert torch.equal(targets, ds.labels[end_idx]), "Targets must come from the last time step."
+    graph_seq, targets = next(iter(train_loader))  # real 5-step sequences; targets = last-step labels
+    seq_len = len(graph_seq)
 
     model = TopologicalGNN(
         node_in_dim=4,
@@ -192,7 +182,7 @@ if __name__ == "__main__":
     loss = F.binary_cross_entropy_with_logits(logits, targets)
     loss.backward()
 
-    assert logits.shape == (len(end_idx),), f"Unexpected logits shape: {tuple(logits.shape)}"
+    assert logits.shape == targets.shape, f"Unexpected logits shape: {tuple(logits.shape)}"
     assert torch.isfinite(logits).all(), "Non-finite logits detected."
 
     # Gradients must reach every part of the model
@@ -206,7 +196,7 @@ if __name__ == "__main__":
     model.eval()
     with torch.no_grad():
         out_fwd = model(graph_seq)
-        out_rev = model(graph_seq[::-1])       # same 5 days, reversed order
+        out_rev = model(graph_seq[::-1])       # same days, reversed order
         out_single = model(graph_seq[-1])      # a single batch = sequence of length 1
     assert not torch.allclose(out_fwd, out_rev), "Reversing time order changed nothing: GRU ignores order!"
     assert out_single.shape == out_fwd.shape, "Single-batch input should also work."
@@ -217,7 +207,7 @@ if __name__ == "__main__":
     print(f"    topology encoder:     {count_params(model.topo_encoder):,}")
     print(f"    temporal GRU (+norm): {count_params(model.temporal_encoder) + count_params(model.temporal_norm):,}")
     print(f"    head:                 {count_params(model.head):,}")
-    print(f"  Sequence: {seq_len} steps x {len(end_idx)} samples | last-step dates {ds.dates[end_idx[0]]} ... {ds.dates[end_idx[-1]]}")
+    print(f"  Sequence: {seq_len} steps x {len(targets)} samples (from the training DataLoader)")
     print(f"  GRU recurrent grad norm:    {model.temporal_encoder.weight_hh_l0.grad.norm().item():.6f}")
     print(f"  Order matters: mean |forward - reversed| logit difference = {(out_fwd - out_rev).abs().mean().item():.4f}")
     print(f"  Initial BCE loss: {loss.item():.4f}")
