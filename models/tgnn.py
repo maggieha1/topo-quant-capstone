@@ -1,5 +1,6 @@
 import os
 import sys
+from typing import List, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -12,8 +13,8 @@ SCRIPTS_DIR = os.path.join(PROJECT_ROOT, "scripts")
 
 class TopologicalGNN(nn.Module):
     """
-    Dual-branch Topological Graph Neural Network for financial regime-shift forecasting.
-    Fuses asset graph embeddings (GAT) with persistent homology landscapes.
+    Spatial-Temporal Topological Graph Neural Network for financial regime-shift forecasting.
+    Processes sequences of L consecutive market graph snapshots + persistence landscapes.
     """
 
     def __init__(
@@ -40,7 +41,7 @@ class TopologicalGNN(nn.Module):
             in_channels=node_in_dim,
             out_channels=hidden_dim // num_heads,
             heads=num_heads,
-            concat=True,          # 4 heads x 8 features -> 32
+            concat=True,
             edge_dim=1,
             dropout=dropout,
         )
@@ -50,14 +51,11 @@ class TopologicalGNN(nn.Module):
             in_channels=hidden_dim,
             out_channels=hidden_dim,
             heads=num_heads,
-            concat=False,         # average the 4 heads -> 32
+            concat=False,
             edge_dim=1,
             dropout=dropout,
         )
         self.gat_norm2 = nn.LayerNorm(hidden_dim)
-
-        # Temporal encoder placeholder (to be added on Day 18)
-        self.temporal_encoder = None
 
         # Branch 2: Persistence landscape projection MLP (300 -> 64 -> 32)
         self.topo_encoder = nn.Sequential(
@@ -70,19 +68,28 @@ class TopologicalGNN(nn.Module):
             nn.GELU(),
         )
 
-        # Fusion & classification head (outputs a raw logit)
+        # Temporal aggregation: 1-layer GRU over L consecutive fused market states
         fusion_dim = hidden_dim + topo_embed_dim
+        self.temporal_encoder = nn.GRU(
+            input_size=fusion_dim,
+            hidden_size=hidden_dim,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.temporal_norm = nn.LayerNorm(hidden_dim)
+
+        # Classification head (final GRU hidden state -> raw logit)
         self.head = nn.Sequential(
-            nn.Linear(fusion_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-        self._init_linear_weights()
+        self._init_weights()
 
-    def _init_linear_weights(self) -> None:
-        """Applies Xavier uniform initialization to MLP Linear layers (leaving GATConv defaults intact)."""
+    def _init_weights(self) -> None:
+        """Xavier init for MLP layers; orthogonal init for GRU recurrent weights."""
         for block in (self.topo_encoder, self.head):
             for module in block.modules():
                 if isinstance(module, nn.Linear):
@@ -90,8 +97,16 @@ class TopologicalGNN(nn.Module):
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
 
+        for name, param in self.temporal_encoder.named_parameters():
+            if "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
     def encode_graph(self, data) -> torch.Tensor:
-        """Runs 2-layer GAT message passing and pools nodes to a graph-level vector."""
+        """Runs 2-layer GAT message passing and pools nodes to (B, hidden_dim)."""
         h = self.gat1(data.x, data.edge_index, edge_attr=data.edge_attr)
         h = F.gelu(self.gat_norm1(h))
         h = F.dropout(h, p=self.dropout, training=self.training)
@@ -99,15 +114,35 @@ class TopologicalGNN(nn.Module):
         h = self.gat2(h, data.edge_index, edge_attr=data.edge_attr)
         h = F.gelu(self.gat_norm2(h))
 
-        # Pool (B * 10, hidden_dim) -> (B, hidden_dim)
         return global_mean_pool(h, data.batch)
 
-    def forward(self, data) -> torch.Tensor:
+    def encode_step(self, data) -> torch.Tensor:
+        """Fuses graph embedding and persistence landscape for one time step -> (B, fusion_dim)."""
         graph_emb = self.encode_graph(data)      # (B, hidden_dim)
         topo_emb = self.topo_encoder(data.topo)  # (B, topo_embed_dim)
+        return torch.cat([graph_emb, topo_emb], dim=-1)
 
-        fused = torch.cat([graph_emb, topo_emb], dim=-1)
-        logits = self.head(fused).squeeze(-1)    # (B,)
+    def forward(self, graph_seq: Union[Sequence, object]) -> torch.Tensor:
+        """
+        Args:
+            graph_seq: List of L PyG Batch objects ordered chronologically [t-L+1, ..., t].
+                       A single Batch is treated as a sequence of length 1.
+        Returns:
+            logits: Tensor of shape (B,) for the regime shift following time t.
+        """
+        if not isinstance(graph_seq, (list, tuple)):
+            graph_seq = [graph_seq]
+
+        batch_size = graph_seq[0].num_graphs
+        assert all(g.num_graphs == batch_size for g in graph_seq), "All time steps must have the same batch size."
+
+        step_embs = [self.encode_step(g) for g in graph_seq]
+        seq_tensor = torch.stack(step_embs, dim=1)    # (B, L, fusion_dim)
+
+        _, h_n = self.temporal_encoder(seq_tensor)    # h_n: (1, B, hidden_dim)
+        final_state = self.temporal_norm(h_n[-1])     # (B, hidden_dim)
+
+        logits = self.head(final_state).squeeze(-1)   # (B,)
         return logits
 
 
@@ -117,6 +152,7 @@ def count_params(module: nn.Module) -> int:
 
 if __name__ == "__main__":
     sys.path.insert(0, SCRIPTS_DIR)
+    from torch_geometric.data import Batch
     from windowing import DATA_PATH
     from build_graph import TOPO_PATH
     from dataloaders import create_chronological_loaders
@@ -128,7 +164,18 @@ if __name__ == "__main__":
         topo_path=TOPO_PATH,
         batch_size=32,
     )
-    batch = next(iter(train_loader))
+    ds = train_loader.dataset.dataset  # the underlying MarketGraphDataset
+
+    # Build a REAL 5-step sequence: for 32 end days, take each day's 4 preceding windows too.
+    # Step s holds windows (i - 4 + s) for every end day i, so the last step is "today".
+    seq_len = 5
+    end_idx = list(range(100, 132))  # 32 consecutive end days, well inside the training block
+    graph_seq = [
+        Batch.from_data_list([ds[i - (seq_len - 1) + s] for i in end_idx])
+        for s in range(seq_len)
+    ]
+    targets = graph_seq[-1].y  # the label belongs to the LAST step (day t)
+    assert torch.equal(targets, ds.labels[end_idx]), "Targets must come from the last time step."
 
     model = TopologicalGNN(
         node_in_dim=4,
@@ -141,34 +188,36 @@ if __name__ == "__main__":
 
     # Forward + backward with the real loss
     model.train()
-    logits = model(batch)
-    loss = F.binary_cross_entropy_with_logits(logits, batch.y)
+    logits = model(graph_seq)
+    loss = F.binary_cross_entropy_with_logits(logits, targets)
     loss.backward()
 
-    assert logits.shape == (batch.y.shape[0],), f"Expected {(batch.y.shape[0],)}, got {tuple(logits.shape)}"
+    assert logits.shape == (len(end_idx),), f"Unexpected logits shape: {tuple(logits.shape)}"
     assert torch.isfinite(logits).all(), "Non-finite logits detected."
 
     # Gradients must reach every part of the model
-    for name, part in [("gat1", model.gat1), ("gat2", model.gat2), ("topo_encoder", model.topo_encoder)]:
+    for name, part in [("gat1", model.gat1), ("gat2", model.gat2),
+                       ("topo_encoder", model.topo_encoder), ("temporal_encoder", model.temporal_encoder)]:
         for pname, p in part.named_parameters():
             assert p.grad is not None and torch.isfinite(p.grad).all(), f"No/invalid gradient in {name}.{pname}"
-    assert model.gat1.att_edge.grad.abs().sum() > 0, "No gradient flowing into GAT edge_attr weights!"
+    assert model.temporal_encoder.weight_hh_l0.grad.abs().sum() > 0, "No gradient flowing into GRU!"
+    assert model.gat1.att_edge.grad.abs().sum() > 0, "No gradient flowing into GAT edge weights!"
 
-    # In eval mode (no dropout) the model must be deterministic
     model.eval()
     with torch.no_grad():
-        out_a, out_b = model(batch), model(batch)
-        graph_emb = model.encode_graph(batch)
-    assert torch.allclose(out_a, out_b), "Eval-mode outputs are not deterministic."
-    assert graph_emb.shape == (batch.num_graphs, model.hidden_dim), f"Unexpected graph_emb shape {tuple(graph_emb.shape)}"
-    assert graph_emb.abs().sum() > 0, "Graph branch is still all zeros."
+        out_fwd = model(graph_seq)
+        out_rev = model(graph_seq[::-1])       # same 5 days, reversed order
+        out_single = model(graph_seq[-1])      # a single batch = sequence of length 1
+    assert not torch.allclose(out_fwd, out_rev), "Reversing time order changed nothing: GRU ignores order!"
+    assert out_single.shape == out_fwd.shape, "Single-batch input should also work."
 
-    graph_params = sum(count_params(m) for m in (model.gat1, model.gat_norm1, model.gat2, model.gat_norm2))
-    print("Success! Multi-head GATConv spatial encoder verified.")
+    print("Success! Spatial-Temporal TopologicalGNN (GAT + GRU) verified.")
     print(f"  Total trainable parameters: {count_params(model):,}")
-    print(f"    graph encoder (GAT):  {graph_params:,}")
+    print(f"    graph encoder (GAT):  {sum(count_params(m) for m in (model.gat1, model.gat_norm1, model.gat2, model.gat_norm2)):,}")
     print(f"    topology encoder:     {count_params(model.topo_encoder):,}")
+    print(f"    temporal GRU (+norm): {count_params(model.temporal_encoder) + count_params(model.temporal_norm):,}")
     print(f"    head:                 {count_params(model.head):,}")
-    print(f"  Graph embedding shape:  {tuple(graph_emb.shape)}  (no longer zeros)")
-    print(f"  GAT1 edge-attention grad norm: {model.gat1.att_edge.grad.norm().item():.6f}")
-    print(f"  Initial BCE loss:       {loss.item():.4f}")
+    print(f"  Sequence: {seq_len} steps x {len(end_idx)} samples | last-step dates {ds.dates[end_idx[0]]} ... {ds.dates[end_idx[-1]]}")
+    print(f"  GRU recurrent grad norm:    {model.temporal_encoder.weight_hh_l0.grad.norm().item():.6f}")
+    print(f"  Order matters: mean |forward - reversed| logit difference = {(out_fwd - out_rev).abs().mean().item():.4f}")
+    print(f"  Initial BCE loss: {loss.item():.4f}")
